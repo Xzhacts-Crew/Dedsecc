@@ -38,12 +38,9 @@ Proyek ini bertujuan untuk merancang, membangun, dan mengelola infrastruktur web
 - Keamanan Terintegrasi: Memanfaatkan OpenVPN untuk akses yang aman dan solusi backup untuk perlindungan data.
 - Pengawasan Terpusat: Menggunakan Prometheus dan Grafana untuk memantau performa sistem secara menyeluruh.
 
-## DAFTAR ISI
-1. [Instalasi dan Konfigurasi Web Server]
-2. [Instalasi dan Konfigurasi SSH]
-3. [Instalasi dan Konfigurasi DNS]
-
 **KONFIGURASI YANG DITERAPKAN :**
+
+# VM 1
 
 ## 1. Instalasi dan Konfigurasi Web Server
 
@@ -353,3 +350,172 @@ apt-get install dnsutils
 1. Lakukan Nslookup untuk menguji Domain
 2. Uji pada sisi ClientGunakan perintah seperti nslookup pada sistem klien untuk memastikan DNS berfungsi dengan baik dan sistem klien dapat menemukan domain yang diperlukan dengan benar.
 
+# VM 2
+
+## 1. Instalasi dan Konfigurasi Haproxy Load Balancing 
+ 	
+```
+                         +-------------------+
+                         |    10.10.10.1     |
+                         |       [vm1]       |
+                         +-------------------+
+                                  |
+                                  |
+                                  v
++----------+          +----------------+          +-----------------+
+|          |  :80     |                |   :80    |                 |
+|  Client  +--------->+    HAProxy     +--------->    Backend      |
+|          |          |                |          |    Servers      |
++----------+          +----------------+          +-----------------+
+      ^                	      ^                          ^
+      |                       |                          |
+   +----+                   +----+                     +----+
+      |                       |                          |
+ +---------+             +---------+                 +---------+
+|  10.10.10.3  | 	| 10.10.10.1  |   	    | 10.10.10.3 |
+|   [vm3]     |  	 |   [vm1]    |  	    |   [vm3]   |
+ +---------+               +---------+   	     +---------+
+```
+**Langkah 1: Instalasi Paket HAProxy**
+```
+root@dlp:~# apt -y install haproxy
+```
+
+**Langkah 2: Mengonfigurasi Paket HAProxy**
+```
+root@dlp:~# vi /etc/haproxy/haproxy.cfg
+```
+**Langkah 3: Tambah Konfigurasi**
+```
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    log-send-hostname
+    daemon
+
+defaults
+    log global
+    mode http
+    option httplog
+    option dontlognull
+    retries 3
+    timeout connect 5000
+    timeout client 50000
+    timeout server 50000
+
+frontend main
+    bind *:80
+    default_backend servers
+
+backend servers
+    balance roundrobin
+    server vm1 10.10.10.1:80 check
+    server vm3 10.10.10.3:80 check
+# Log settings
+log 127.0.0.1 local0 debug
+log 127.0.0.1 local1 notice
+```
+**Langkah 4: Restart layanan HAProxy**
+```
+root@dlp:~# systemctl restart haproxy
+```
+
+**Langkah 5: Mengubah pengaturan pada backend Web servers untuk mencatat header X-Forwarded-For.**
+
+Untuk kasus pengaturan Apache2:
+```
+root@node01:~# a2enmod remoteip
+root@node01:~# vi /etc/apache2/apache2.conf
+```
+Ganti seperti berikut:
+```
+RemoteIPHeader X-Forwarded-For
+RemoteIPInternalProxy 10.0.0.30
+LogFormat "%v:%p %a %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"" vhost_combined
+LogFormat "%a %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"" combined
+```
+**Langkah 6: Restart layanan Apache2**
+```
+root@node01:~# systemctl restart apache2
+```
+**Langkah 7: Verifikasi bahwa semuanya berfungsi normal dengan mengakses frontend Server HAProxy.**
+
+## 2. Instalasi dan Konfigurasi Prometheus
+
+Untuk mengonfigurasi Pengekspor Blackbox, memungkinkan untuk melakukan pengecekan pada endpoint melalui HTTP, HTTPS, DNS, TCP, dan ICMP.
+
+**Langkah 1: Pada Node yang ingin Anda monitor dengan Pengekspor Blackbox, lakukan instalasi.**
+
+```
+root@node02:~# apt -y install prometheus-blackbox-exporter
+```
+
+**Langkah 2: Ini adalah berkas pengaturan dari Pengekspor Blackbox. (Pada contoh ini, biarkan default)**
+
+```
+root@node02:~# vi /etc/prometheus/blackbox.yml
+```
+
+```
+modules:
+  http_2xx:
+    prober: http
+  http_post_2xx:
+    prober: http
+    http:
+      method: POST
+```
+
+**Langkah 3: Restart layanan Blackbox Exporter**
+
+```
+root@node02:~# systemctl enable prometheus-blackbox-exporter
+
+```
+
+**Langkah 4: Tambahkan pengaturan pada Node Server Prometheus.**
+
+```
+root@dlp:~# vi /etc/prometheus/prometheus.yml
+```
+```
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: 'prometheus'
+
+    # Override the global default and scrape targets from this job every 5 seconds.
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: node
+    # If prometheus-node-exporter is installed, grab stats about the local
+    # machine by default.
+    static_configs:
+      - targets: ['localhost:9100']
+
+  - job_name:  'Blackbox_http'
+    metrics_path:  /probe
+    params:
+      module:  [http_2xx]
+    static_configs:
+      -  targets:
+         -  10.10.10.2
+    relabel_configs:
+      -  source_labels:  [__address__]
+         target_label:  __param_target
+      -  source_labels:  [__param_target]
+         target_label:  instance
+      -  target_label:  __address__
+
+         replacement:  10.10.10.2:9115
+```
+**Langkah 5: Restart layanan Prometheus**
+```
+root@dlp:~# systemctl restart prometheus
+```
